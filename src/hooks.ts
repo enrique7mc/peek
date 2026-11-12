@@ -38,9 +38,26 @@ export function hookRead(input: string, cfg: Config): void {
   }
 }
 
+/**
+ * True for sessions nobody is watching: `claude -p`, SDK jobs, relays. Uploads
+ * are meant for the person at the keyboard, so those sessions MUST NOT claim
+ * them. Set PEEK_CLAIM_UNATTENDED=1 to allow it anyway.
+ */
+export function isUnattended(env: Record<string, string | undefined> = process.env): boolean {
+  if (env.PEEK_CLAIM_UNATTENDED === "1") return false;
+  if (env.CLAUDE_CODE_SESSION_ATTENDED === "0") return true;
+  return (env.CLAUDE_CODE_ENTRYPOINT ?? "").startsWith("sdk");
+}
+
 /** UserPromptSubmit: claim recent uploads and hand their paths to the agent. */
-export function hookPrompt(input: string, cfg: Config, now = Date.now()): string | null {
+export function hookPrompt(
+  input: string,
+  cfg: Config,
+  now = Date.now(),
+  env: Record<string, string | undefined> = process.env,
+): string | null {
   try {
+    if (isUnattended(env)) return null;
     let session = "unknown";
     try {
       const ev = JSON.parse(input);
@@ -49,8 +66,11 @@ export function hookPrompt(input: string, cfg: Config, now = Date.now()): string
 
     const claimed: store.Item[] = [];
     for (const item of store.unclaimed(cfg, now, store.CLAIM_WINDOW_MS)) {
-      const c = store.claim(cfg, item.id, session, now);
-      if (c) claimed.push(c);
+      // One bad item MUST NOT drop the others we already claimed.
+      try {
+        const c = store.claim(cfg, item.id, session, now);
+        if (c) claimed.push(c);
+      } catch {}
     }
     if (!claimed.length) return null;
 

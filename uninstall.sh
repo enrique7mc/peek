@@ -29,10 +29,15 @@ if [ "$(uname)" = Darwin ]; then
   [ -f "$PLIST" ] && rm -f "$PLIST" && say "removed $PLIST" || true
 fi
 
-if [ -L "$BIN_DIR/peek" ]; then rm -f "$BIN_DIR/peek"; say "removed $BIN_DIR/peek"; fi
+if [ -L "$BIN_DIR/peek" ] && [ "$(readlink "$BIN_DIR/peek")" = "$REPO/bin/peek" ]; then
+  rm -f "$BIN_DIR/peek"; say "removed $BIN_DIR/peek"
+fi
+
+rm -f "$(dirname "$CONF")/bun"
 
 if [ -x "$BUN" ]; then
-  [ -f "$CLAUDE_DIR/settings.json" ] && "$BUN" "$REPO/scripts/claude-config.ts" hooks uninstall "$CLAUDE_DIR/settings.json"
+  [ -f "$CLAUDE_DIR/settings.json" ] && "$BUN" "$REPO/scripts/claude-config.ts" hooks uninstall "$CLAUDE_DIR/settings.json" \
+    "\"$BUN\" \"$REPO/src/cli.ts\" hook read" "\"$BUN\" \"$REPO/src/cli.ts\" hook prompt"
   [ -f "$CLAUDE_DIR/CLAUDE.md" ] && "$BUN" "$REPO/scripts/claude-config.ts" line uninstall "$CLAUDE_DIR/CLAUDE.md"
   [ -f "$CODEX_DIR/AGENTS.md" ] && "$BUN" "$REPO/scripts/claude-config.ts" line uninstall "$CODEX_DIR/AGENTS.md"
 fi

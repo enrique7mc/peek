@@ -1,12 +1,16 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configFor, type Config } from "../src/config";
-import { hookPrompt, hookRead } from "../src/hooks";
+import { configFor, loadConfig, type Config } from "../src/config";
+import { hookPrompt, hookRead, isUnattended } from "../src/hooks";
 import { startServer } from "../src/server";
 import * as store from "../src/store";
-import { installHooks, installLine, uninstallHooks, uninstallLine } from "../scripts/claude-config";
+import { installHooks, installLine, isPeekHook, uninstallHooks, uninstallLine } from "../scripts/claude-config";
+
+const REPO = join(import.meta.dir, "..");
+const BUN = process.execPath;
+const ATTENDED = { CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_CODE_ENTRYPOINT: "cli" };
 
 const roots: string[] = [];
 function fresh(): { cfg: Config; root: string } {
@@ -43,9 +47,10 @@ describe("store", () => {
   });
 
   test("same content on the board moves to the top instead of duplicating", () => {
-    const a = store.add(cfg, "board", { srcPath: file(root, "a.png"), name: "a.png", source: "hook", now: 1_000_000 });
-    store.add(cfg, "board", { srcPath: file(root, "b.png", "other"), name: "b.png", source: "cli", now: 2_000_000 });
-    const again = store.add(cfg, "board", { srcPath: file(root, "a2.png"), name: "a2.png", source: "hook", note: "new note", now: 3_000_000 });
+    const t = Date.now() - 10_000;
+    const a = store.add(cfg, "board", { srcPath: file(root, "a.png"), name: "a.png", source: "hook", now: t });
+    store.add(cfg, "board", { srcPath: file(root, "b.png", "other"), name: "b.png", source: "cli", now: t + 1000 });
+    const again = store.add(cfg, "board", { srcPath: file(root, "a2.png"), name: "a2.png", source: "hook", note: "new note", now: t + 2000 });
     expect(again.deduped).toBe(true);
     const items = store.list(cfg, "board");
     expect(items).toHaveLength(2);
@@ -75,6 +80,44 @@ describe("store", () => {
     const meta = JSON.parse(readFileSync(join(cfg.boardDir, `${item.id}.json`), "utf8"));
     writeFileSync(join(cfg.boardDir, `${item.id}.json`), JSON.stringify({ ...meta, file: "../../../etc/passwd" }));
     expect(store.find(cfg, item.id)).toBeNull();
+  });
+
+  test("inbox never drops waiting uploads; it refuses the 9th instead", () => {
+    const ids = [];
+    for (let k = 0; k < store.MAX_ITEMS; k++) ids.push(store.add(cfg, "inbox", { data: PNG, name: `u${k}.png`, source: "upload" }).item.id);
+    expect(() => store.add(cfg, "inbox", { data: PNG, name: "u9.png", source: "upload" })).toThrow(/inbox full/);
+    expect(store.list(cfg, "inbox").map((i) => i.id).sort()).toEqual(ids.sort());
+    // Once claimed, old uploads make room again.
+    store.claim(cfg, ids[0]!, "s");
+    store.claim(cfg, ids[1]!, "s");
+    store.add(cfg, "inbox", { data: PNG, name: "u10.png", source: "upload" });
+    expect(store.list(cfg, "inbox")).toHaveLength(store.MAX_ITEMS);
+    expect(store.pending(cfg)).toBe(store.MAX_ITEMS - 1);
+  });
+
+  test("expired items are hidden before the sweep runs", () => {
+    store.add(cfg, "board", { data: PNG, name: "old.png", source: "cli", now: Date.now() - store.MAX_AGE_MS + 1000 });
+    expect(store.list(cfg, "board")).toHaveLength(1);
+    expect(store.list(cfg, "board", Date.now() + 2000)).toHaveLength(0);
+  });
+
+  test("long names keep their extension", () => {
+    const name = "x".repeat(300) + ".png";
+    const { item } = store.add(cfg, "board", { data: PNG, name, source: "cli" });
+    expect(item.name).toHaveLength(200);
+    expect(item.name.endsWith(".png")).toBe(true);
+  });
+
+  test("parallel pushes of the same bytes leave one item", async () => {
+    const p = file(root, "same.png");
+    const env = { ...process.env, PEEK_DIR: cfg.dir, PEEK_CONFIG: join(root, "none") };
+    for (let round = 0; round < 3; round++) {
+      const procs = Array.from({ length: 10 }, () =>
+        Bun.spawn([BUN, join(REPO, "src/cli.ts"), p], { env, stdout: "ignore", stderr: "ignore" }),
+      );
+      await Promise.all(procs.map((x) => x.exited));
+      expect(store.list(cfg, "board")).toHaveLength(1);
+    }
   });
 
   test("claim is exclusive", () => {
@@ -117,19 +160,45 @@ describe("hooks", () => {
 
   test("prompt hook injects recent uploads once, to one session", () => {
     const { item } = store.add(cfg, "inbox", { data: PNG, name: "photo.png", source: "upload", note: "the bug" });
-    const out = hookPrompt(JSON.stringify({ session_id: "sess-1" }), cfg);
+    const out = hookPrompt(JSON.stringify({ session_id: "sess-1" }), cfg, Date.now(), ATTENDED);
     const ctx = JSON.parse(out!).hookSpecificOutput;
     expect(ctx.hookEventName).toBe("UserPromptSubmit");
     expect(ctx.additionalContext).toContain(join(cfg.inboxDir, item.file));
     expect(ctx.additionalContext).toContain("the bug");
-    expect(hookPrompt(JSON.stringify({ session_id: "sess-2" }), cfg)).toBeNull();
+    expect(hookPrompt(JSON.stringify({ session_id: "sess-2" }), cfg, Date.now(), ATTENDED)).toBeNull();
     expect(store.list(cfg, "inbox")[0]!.claimedBy).toBe("sess-1");
+  });
+
+  test("unattended sessions do not claim uploads", () => {
+    store.add(cfg, "inbox", { data: PNG, name: "p.png", source: "upload" });
+    expect(isUnattended({ CLAUDE_CODE_SESSION_ATTENDED: "0" })).toBe(true);
+    expect(isUnattended({ CLAUDE_CODE_ENTRYPOINT: "sdk-cli" })).toBe(true);
+    expect(isUnattended({ CLAUDE_CODE_ENTRYPOINT: "sdk-cli", PEEK_CLAIM_UNATTENDED: "1" })).toBe(false);
+    expect(isUnattended({})).toBe(false);
+    expect(hookPrompt(JSON.stringify({ session_id: "bot" }), cfg, Date.now(), { CLAUDE_CODE_SESSION_ATTENDED: "0" })).toBeNull();
+    expect(store.unclaimed(cfg)).toHaveLength(1);
+  });
+
+  test("hooks as processes: exit 0, read hook prints nothing", async () => {
+    const env = { ...process.env, ...ATTENDED, PEEK_DIR: cfg.dir, PEEK_CONFIG: join(root, "none") };
+    const run = async (kind: string, input: string) => {
+      const p = Bun.spawn([BUN, join(REPO, "src/cli.ts"), "hook", kind], { env, stdin: new TextEncoder().encode(input), stdout: "pipe", stderr: "pipe" });
+      return { code: await p.exited, out: await new Response(p.stdout).text(), errOut: await new Response(p.stderr).text() };
+    };
+    for (const input of ["", "garbage", readEv(file(root, "h.png")), readEv("/nope.png")]) {
+      expect(await run("read", input)).toEqual({ code: 0, out: "", errOut: "" });
+    }
+    expect(await run("prompt", "garbage")).toEqual({ code: 0, out: "", errOut: "" });
+    store.add(cfg, "inbox", { data: PNG, name: "q.png", source: "upload" });
+    const r = await run("prompt", JSON.stringify({ session_id: "proc" }));
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out).hookSpecificOutput.additionalContext).toContain(cfg.inboxDir);
   });
 
   test("prompt hook skips uploads older than 30 minutes", () => {
     const old = Date.now() - store.CLAIM_WINDOW_MS - 60_000;
     store.add(cfg, "inbox", { data: PNG, name: "old.png", source: "upload", now: old });
-    expect(hookPrompt(JSON.stringify({ session_id: "s" }), cfg)).toBeNull();
+    expect(hookPrompt(JSON.stringify({ session_id: "s" }), cfg, Date.now(), ATTENDED)).toBeNull();
     expect(store.unclaimed(cfg)).toHaveLength(1); // still there for `peek pull`
   });
 });
@@ -146,6 +215,17 @@ describe("server", () => {
     expect(await page.text()).toContain("<title>peek</title>");
     const items = await (await fetch(base + "/api/items")).json();
     expect(items).toEqual({ board: [], inbox: [] });
+  });
+
+  test("unknown Host is refused (DNS rebinding) and the page can't be framed", async () => {
+    const port = srv.server.port;
+    const evil = await fetch(base + "/api/items", { headers: { Host: `evil.example:${port}` } });
+    expect(evil.status).toBe(421);
+    const fwd = await fetch(base + "/api/items", { headers: { "X-Forwarded-Host": "evil.example" } });
+    expect(fwd.status).toBe(421);
+    const page = await fetch(base + "/");
+    expect(page.headers.get("x-frame-options")).toBe("DENY");
+    expect(page.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
   });
 
   test("path traversal never resolves", async () => {
@@ -177,6 +257,9 @@ describe("server", () => {
 
   test("files carry type, sandbox CSP for HTML, and support ranges", async () => {
     const html = store.add(cfg, "board", { data: new TextEncoder().encode("<p>x</p>"), name: "page.html", source: "cli" }).item;
+    // A tampered mime in the metadata MUST NOT change how the file is served.
+    const metaPath = join(cfg.boardDir, `${html.id}.json`);
+    writeFileSync(metaPath, JSON.stringify({ ...JSON.parse(readFileSync(metaPath, "utf8")), mime: "text/html;charset=utf-8" }));
     const r = await fetch(`${base}/files/${html.id}`);
     expect(r.headers.get("content-type")).toContain("text/html");
     expect(r.headers.get("content-security-policy")).toBe("sandbox allow-scripts");
@@ -186,6 +269,16 @@ describe("server", () => {
     expect(part.status).toBe(206);
     expect((await part.arrayBuffer()).byteLength).toBe(10);
     expect(part.headers.get("content-range")).toBe(`bytes 0-9/${PNG.byteLength}`);
+    for (const r of ["bytes=0-1,3-4", "bytes=5-2", "bytes=abc"]) {
+      const full = await fetch(`${base}/files/${png.id}`, { headers: { Range: r } });
+      expect(full.status).toBe(200);
+      expect((await full.arrayBuffer()).byteLength).toBe(PNG.byteLength);
+    }
+    expect((await fetch(`${base}/files/${png.id}`, { headers: { Range: "bytes=-0" } })).status).toBe(416);
+    expect((await fetch(`${base}/files/${png.id}`, { headers: { Range: `bytes=${PNG.byteLength}-` } })).status).toBe(416);
+    const tail = await fetch(`${base}/files/${png.id}`, { headers: { Range: "bytes=-5" } });
+    expect(tail.status).toBe(206);
+    expect((await tail.arrayBuffer()).byteLength).toBe(5);
   });
 
   test("SSE announces changes", async () => {
@@ -198,6 +291,25 @@ describe("server", () => {
     const { value } = await reader.read();
     expect(dec.decode(value)).toContain("event: change");
     ctrl.abort();
+  });
+
+  test("a full inbox answers 409 and keeps what is waiting", async () => {
+    const { cfg: c3 } = fresh();
+    const s3 = startServer(c3, { quiet: true });
+    const b3 = `http://127.0.0.1:${s3.server.port}`;
+    const up = (n: number) => {
+      const f = new FormData();
+      for (let k = 0; k < n; k++) f.append("file", new File([PNG], `p${k}.png`, { type: "image/png" }));
+      return fetch(b3 + "/api/upload", { method: "POST", body: f, headers: { "X-Peek": "1" } });
+    };
+    expect((await up(9)).status).toBe(409);
+    expect(store.list(c3, "inbox")).toHaveLength(0);
+    expect((await up(8)).status).toBe(201);
+    const r = await up(1);
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toContain("inbox full");
+    expect(store.pending(c3)).toBe(8);
+    s3.stop();
   });
 
   test("delete one and clear", async () => {
@@ -220,6 +332,23 @@ describe("server", () => {
   });
 });
 
+describe("config file", () => {
+  test("empty values and inline comments", () => {
+    const { root } = fresh();
+    const p = join(root, "env");
+    writeFileSync(p, 'PEEK_PORT="9001" # quoted\nPEEK_DIR=\nPEEK_MOUNT=/peek # c\nPEEK_PUBLIC_URL=\n');
+    const c = loadConfig({ PEEK_CONFIG: p });
+    expect(c.port).toBe(9001);
+    expect(c.dir.endsWith("/.peek")).toBe(true);
+    expect(c.mount).toBe("/peek");
+    expect(c.publicUrl).toBe("http://127.0.0.1:9001/");
+    writeFileSync(p, "PEEK_PORT=nope\nPEEK_DIR=rel/dir\n");
+    const d = loadConfig({ PEEK_CONFIG: p });
+    expect(d.port).toBe(8790);
+    expect(d.dir.startsWith("/")).toBe(true);
+  });
+});
+
 describe("config edits", () => {
   const existing = {
     hooks: {
@@ -238,13 +367,43 @@ describe("config edits", () => {
     expect(count(twice, "PostToolUse", "read")).toBe(1);
     expect(count(twice, "UserPromptSubmit", "prompt")).toBe(1);
     expect(twice.hooks!.PostToolUse![0]).toEqual(existing.hooks.PostToolUse[0]!);
-    expect(uninstallHooks(twice)).toEqual(existing);
+    expect(uninstallHooks(twice, [cmds.read, cmds.prompt])).toEqual(existing);
   });
 
   test("agent line is added once and removed cleanly", () => {
     const line = "To show the user an image, run `peek <file> -n \"x\"`.";
     const once = installLine("# Notes\n", line);
     expect(installLine(once, line)).toBe(once);
-    expect(uninstallLine(once).trim()).toBe("# Notes");
+    expect(uninstallLine(once)).toBe("# Notes\n");
+  });
+
+  test("a custom agent line is idempotent and replaces the old wording", () => {
+    const legacy = "# N\n\nTo show the user an image, run `peek <file> -n \"x\"`.\n";
+    const custom = "Use the viewer tool for images.";
+    const a = installLine(legacy, custom);
+    expect(a).not.toContain("run `peek <file>");
+    expect(installLine(installLine(a, custom), custom)).toBe(a);
+    expect(uninstallLine(a)).toBe("# N\n");
+  });
+
+  test("other tools' hooks that look similar are left alone", () => {
+    expect(isPeekHook("node ~/tools/other/src/cli.ts hook read", "read")).toBe(false);
+    expect(isPeekHook("/usr/bin/my-peek hook read", "read")).toBe(false);
+    expect(isPeekHook('"/b/bun" "/x/peek/src/cli.ts" hook read', "read")).toBe(true);
+    expect(isPeekHook("peek hook prompt", "prompt")).toBe(true);
+  });
+
+  test("writes through a symlinked settings file and keeps its mode", async () => {
+    const { root } = fresh();
+    const real = join(root, "dotfiles-settings.json");
+    const link = join(root, "settings.json");
+    writeFileSync(real, JSON.stringify(existing, null, 2) + "\n");
+    chmodSync(real, 0o600);
+    symlinkSync(real, link);
+    const p = Bun.spawn([BUN, join(REPO, "scripts/claude-config.ts"), "hooks", "install", link, cmds.read, cmds.prompt], { stdout: "ignore" });
+    expect(await p.exited).toBe(0);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(statSync(real).mode & 0o777).toBe(0o600);
+    expect(readFileSync(real, "utf8")).toContain("hook read");
   });
 });

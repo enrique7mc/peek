@@ -44,6 +44,8 @@ export const MAX_ITEMS = 8;
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const CLAIM_WINDOW_MS = 30 * 60 * 1000;
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+/** Cap for `peek <file>`: the file is read into memory to hash it. */
+export const MAX_PUSH_BYTES = 200 * 1024 * 1024;
 const ORPHAN_GRACE_MS = 5 * 60 * 1000;
 
 export const ID_RE = /^\d{8}T\d{6}-[0-9a-f]{4}$/;
@@ -142,7 +144,12 @@ function readClaim(path: string): { at: string; by: string } | null {
 const newestFirst = (a: Item, b: Item) =>
   a.created < b.created ? 1 : a.created > b.created ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
 
-export function list(cfg: Config, kind: Kind): Item[] {
+/** Items newest first, without the ones past MAX_AGE_MS (the next sweep removes those). */
+export function list(cfg: Config, kind: Kind, now = Date.now()): Item[] {
+  return listAll(cfg, kind).filter((i) => now - Date.parse(i.created) <= MAX_AGE_MS);
+}
+
+function listAll(cfg: Config, kind: Kind): Item[] {
   const dir = dirOf(cfg, kind);
   let names: string[];
   try {
@@ -189,9 +196,51 @@ export function sha256(data: Uint8Array): string {
   return new Bun.CryptoHasher("sha256").update(data).digest("hex");
 }
 
+/** A safe display name of at most 200 chars. Truncation keeps the extension. */
 export function cleanName(name: string): string {
-  const n = basename(name).replace(/[\u0000-\u001f\u007f]/g, "").trim();
-  return (n || "file").slice(0, 200);
+  const n = basename(name).replace(/[\u0000-\u001f\u007f]/g, "").trim() || "file";
+  if (n.length <= 200) return n;
+  const ext = extname(n);
+  return ext.length > 1 && ext.length <= 10 ? n.slice(0, 200 - ext.length) + ext : n.slice(0, 200);
+}
+
+const LOCK_WAIT_MS = 2000;
+const LOCK_STALE_MS = 10_000;
+
+/**
+ * Run `fn` while holding `<dir>/.lock` (an O_EXCL file). This serializes the
+ * read-modify-write steps (dedupe, sweep, delete, claim) across processes.
+ * If the lock can't be taken in time, `fn` runs anyway: a rare duplicate is
+ * better than a hook that hangs.
+ */
+export function withLock<T>(dir: string, fn: () => T): T {
+  const lock = join(dir, ".lock");
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let held = false;
+  for (;;) {
+    try {
+      closeSync(openSync(lock, "wx"));
+      held = true;
+      break;
+    } catch (e: any) {
+      if (e?.code !== "EEXIST") break;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
+          unlinkQuiet(lock);
+          continue;
+        }
+      } catch {
+        continue; // the holder released it between our two calls
+      }
+      if (Date.now() > deadline) break;
+      Bun.sleepSync(3);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) unlinkQuiet(lock);
+  }
 }
 
 export interface AddInput {
@@ -214,23 +263,38 @@ export function add(cfg: Config, kind: Kind, input: AddInput): { item: Item; ded
   ensureDirs(cfg);
   const dir = dirOf(cfg, kind);
   const now = input.now ?? Date.now();
+  if (!input.data && statSync(input.srcPath!).size > MAX_PUSH_BYTES)
+    throw new PeekError(`larger than ${MAX_PUSH_BYTES / 1024 / 1024} MB`);
   const bytes = input.data ?? readFileSync(input.srcPath!);
   const hash = sha256(bytes);
   const note = input.note?.trim() || null;
   const cwd = input.cwd ?? null;
 
-  if (kind === "board") {
-    const dup = list(cfg, "board").find((i) => i.sha256 === hash);
-    if (dup) {
-      dup.created = new Date(now).toISOString();
-      if (note) dup.note = note;
-      if (cwd) dup.cwd = cwd;
-      writeMeta(dir, dup);
-      sweep(cfg, kind, now);
-      return { item: dup, deduped: true };
+  return withLock(dir, () => {
+    if (kind === "board") {
+      const dup = list(cfg, "board", now).find((i) => i.sha256 === hash);
+      if (dup) {
+        dup.created = new Date(now).toISOString();
+        if (note) dup.note = note;
+        if (cwd) dup.cwd = cwd;
+        writeMeta(dir, dup);
+        sweepLocked(cfg, kind, now);
+        return { item: dup, deduped: true };
+      }
+    } else if (pending(cfg, now) >= MAX_ITEMS) {
+      throw new PeekError(`inbox full: ${MAX_ITEMS} uploads are waiting. Run \`peek pull\` or delete some.`);
     }
-  }
+    return { item: insert(cfg, kind, dir, { name, ext, mime, bytes, hash, note, cwd, now, source: input.source }), deduped: false };
+  });
+}
 
+function insert(
+  cfg: Config,
+  kind: Kind,
+  dir: string,
+  a: { name: string; ext: string; mime: string; bytes: Uint8Array; hash: string; note: string | null; cwd: string | null; now: number; source: Source },
+): Item {
+  const { name, ext, mime, bytes, hash, note, cwd, now } = a;
   const id = newId(dir, now);
   const file = `${id}.${ext}`;
   // Write the bytes we hashed (not a copy of the path) so the stored file
@@ -245,7 +309,7 @@ export function add(cfg: Config, kind: Kind, input: AddInput): { item: Item; ded
     size: bytes.byteLength,
     sha256: hash,
     note,
-    source: input.source,
+    source: a.source,
     cwd,
     created: new Date(now).toISOString(),
   };
@@ -254,8 +318,13 @@ export function add(cfg: Config, kind: Kind, input: AddInput): { item: Item; ded
     item.claimedBy = null;
   }
   writeMeta(dir, item);
-  sweep(cfg, kind, now);
-  return { item, deduped: false };
+  sweepLocked(cfg, kind, now);
+  return item;
+}
+
+/** Unclaimed inbox items that still count against the inbox limit. */
+export function pending(cfg: Config, now = Date.now()): number {
+  return list(cfg, "inbox", now).filter((i) => !i.claimed).length;
 }
 
 function unlinkQuiet(path: string) {
@@ -277,30 +346,50 @@ function removeIn(dir: string, id: string) {
 export function remove(cfg: Config, id: string): boolean {
   const f = find(cfg, id);
   if (!f) return false;
-  removeIn(dirOf(cfg, f.kind), id);
+  const dir = dirOf(cfg, f.kind);
+  withLock(dir, () => removeIn(dir, id));
   return true;
 }
 
 export function clear(cfg: Config, kind: Kind): number {
-  const items = list(cfg, kind);
-  for (const i of items) removeIn(dirOf(cfg, kind), i.id);
-  return items.length;
+  const dir = dirOf(cfg, kind);
+  return withLock(dir, () => {
+    const items = listAll(cfg, kind);
+    for (const i of items) removeIn(dir, i.id);
+    return items.length;
+  });
 }
 
-/** Keep the MAX_ITEMS newest items that are younger than MAX_AGE_MS. Remove stray files. */
+/**
+ * Keep the MAX_ITEMS newest items that are younger than MAX_AGE_MS, and remove
+ * stray files. In the inbox, unclaimed uploads never lose their place to newer
+ * ones: `add` refuses new uploads instead, so nothing is dropped silently.
+ */
 export function sweep(cfg: Config, kind: Kind, now = Date.now()): number {
   const dir = dirOf(cfg, kind);
-  const items = list(cfg, kind);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {}
+  return withLock(dir, () => sweepLocked(cfg, kind, now));
+}
+
+function sweepLocked(cfg: Config, kind: Kind, now: number): number {
+  const dir = dirOf(cfg, kind);
+  const items = listAll(cfg, kind);
+  const isFresh = (i: Item) => now - Date.parse(i.created) <= MAX_AGE_MS;
+  const isWaiting = (i: Item) => kind === "inbox" && !i.claimed;
+  // Waiting uploads always keep their place; the other items share what is left.
+  let slots = MAX_ITEMS - items.filter((i) => isFresh(i) && isWaiting(i)).length;
+  const live = new Set<string>();
   let removed = 0;
-  items.forEach((item, idx) => {
-    const age = now - Date.parse(item.created);
-    if (idx >= MAX_ITEMS || !(age <= MAX_AGE_MS)) {
+  for (const item of items) {
+    if (isFresh(item) && (isWaiting(item) || slots-- > 0)) live.add(item.id);
+    else {
       removeIn(dir, item.id);
       removed++;
     }
-  });
+  }
 
-  const live = new Set(items.slice(0, MAX_ITEMS).map((i) => i.id));
   let names: string[] = [];
   try {
     names = readdirSync(dir);
@@ -309,7 +398,7 @@ export function sweep(cfg: Config, kind: Kind, now = Date.now()): number {
     const id = n.startsWith(".") ? null : n.split(".")[0]!;
     if (id && live.has(id)) continue;
     try {
-      if (now - statSync(join(dir, n)).mtimeMs > ORPHAN_GRACE_MS) unlinkQuiet(join(dir, n));
+      if (Date.now() - statSync(join(dir, n)).mtimeMs > ORPHAN_GRACE_MS) unlinkQuiet(join(dir, n));
     } catch {}
   }
   return removed;
@@ -322,8 +411,14 @@ export function sweep(cfg: Config, kind: Kind, now = Date.now()): number {
 export function claim(cfg: Config, id: string, by: string, now = Date.now()): Item | null {
   if (!ID_RE.test(id)) return null;
   const dir = cfg.inboxDir;
+  // The lock keeps a sweep or delete from removing the item between our read
+  // and our write, so a claimed path always exists when we hand it out.
+  return withLock(dir, () => claimLocked(dir, id, by, now));
+}
+
+function claimLocked(dir: string, id: string, by: string, now: number): Item | null {
   const meta = readMeta(join(dir, `${id}.json`));
-  if (!meta || meta.claimed) return null;
+  if (!meta || meta.claimed || !existsSync(join(dir, meta.file))) return null;
 
   const at = new Date(now).toISOString();
   let fd: number;
@@ -345,7 +440,7 @@ export function claim(cfg: Config, id: string, by: string, now = Date.now()): It
 
 /** Unclaimed inbox items, oldest first. `windowMs` limits them by age. */
 export function unclaimed(cfg: Config, now = Date.now(), windowMs = Infinity): Item[] {
-  return list(cfg, "inbox")
+  return list(cfg, "inbox", now)
     .filter((i) => !i.claimed && now - Date.parse(i.created) <= windowMs)
     .reverse();
 }

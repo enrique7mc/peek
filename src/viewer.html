@@ -133,6 +133,7 @@ const BASE = (() => {
 })();
 const u = (p) => new URL(p, BASE).toString();
 const fileUrl = (it, dl) => u("files/" + encodeURIComponent(it.id)) + (dl ? "?download=1" : "");
+const CLAIM_WINDOW_MS = 30 * 60 * 1000; // keep in sync with src/store.ts
 const EXTS = ["png", "jpg", "jpeg", "webp", "gif", "svg", "pdf", "html", "htm", "mp4", "mov"];
 const MAX = 50 * 1024 * 1024;
 
@@ -178,7 +179,11 @@ function markSeen() {
   for (const it of board) seen.add(keyOf(it));
   if (unseen) { unseen = 0; badge(); }
 }
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { markSeen(); refresh(); } });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  markSeen(); refresh();
+  if (es && es.readyState === EventSource.CLOSED) { backoff = 1000; connect(); }
+});
 window.addEventListener("focus", markSeen);
 
 // ---- rendering --------------------------------------------------------------
@@ -234,7 +239,9 @@ function renderInbox() {
         h("div", { class: "small muted" }, (it.note ? it.name + " · " : "") + ago(it.created))),
       it.claimed
         ? h("span", { class: "pill", title: it.claimedBy || "" }, "claimed by " + (it.claimedBy || "?").slice(0, 8))
-        : h("span", { class: "pill wait" }, "waiting"),
+        : Date.now() - Date.parse(it.created) > CLAIM_WINDOW_MS
+          ? h("span", { class: "pill", title: "Older than 30 minutes, so no prompt picks it up. Run `peek pull` on the host." }, "expired · peek pull")
+          : h("span", { class: "pill wait" }, "waiting"),
       h("button", { class: "danger", type: "button", title: "Delete", onclick: () => del(it.id) }, "✕"))));
 }
 
@@ -287,11 +294,22 @@ $("clear").addEventListener("click", async (e) => {
   refresh();
 });
 
+// EventSource retries on its own after a dropped connection, but gives up for
+// good on a non-200 answer, such as the proxy's 502 while the server restarts.
+// So when it reaches CLOSED, start a new one with backoff.
+let es = null, backoff = 1000;
 function connect() {
-  const es = new EventSource(u("api/events"));
+  es = new EventSource(u("api/events"));
   es.addEventListener("change", refresh);
-  es.onopen = () => { $("conn").className = "on"; $("conn").title = "live"; refresh(); };
-  es.onerror = () => { $("conn").className = ""; $("conn").title = "reconnecting"; };
+  es.onopen = () => { backoff = 1000; $("conn").className = "on"; $("conn").title = "live"; refresh(); };
+  es.onerror = () => {
+    $("conn").className = ""; $("conn").title = "reconnecting";
+    if (es.readyState === EventSource.CLOSED) {
+      es.close();
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 30000);
+    }
+  };
 }
 
 // ---- upload -----------------------------------------------------------------
@@ -322,7 +340,7 @@ async function uploadAll(files) {
     try { await send(f, note); ok++; } catch (e) { errs.push(`${f.name}: ${e.message}`); }
   }
   if (ok) $("note").value = "";
-  status(errs.length ? errs.join(" · ") : `Uploaded ${ok} file${ok === 1 ? "" : "s"}. The next prompt gets ${ok === 1 ? "it" : "them"}.`, errs.length > 0);
+  status(errs.length ? errs.join(" · ") : `Uploaded ${ok} file${ok === 1 ? "" : "s"}. The next prompt in the next 30 minutes gets ${ok === 1 ? "it" : "them"}.`, errs.length > 0);
   refresh();
 }
 

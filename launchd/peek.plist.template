@@ -10,6 +10,11 @@
 		<string>__BUN__</string>
 		<string>__REPO__/src/server.ts</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PEEK_CONFIG</key>
+		<string>__CONFIG__</string>
+	</dict>
 	<key>WorkingDirectory</key>
 	<string>__REPO__</string>
 	<key>RunAtLoad</key>

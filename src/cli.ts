@@ -130,6 +130,8 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
+  if (files.length > store.MAX_ITEMS)
+    err(`warning: the board keeps ${store.MAX_ITEMS} items, so only the last ${store.MAX_ITEMS} of ${files.length} files stay`);
   let code = 0;
   let pushed = 0;
   for (const f of files) {

@@ -7,7 +7,7 @@ Agents (Claude Code, Codex, scripts) run on a headless box you reach over ssh. W
 - **Agent → you:** `peek shot.png -n "login page after the fix"` puts the file on a board. An open browser tab on your laptop, phone or tablet shows it within a second, with no reload. A Claude Code hook also pushes every image an agent `Read`s.
 - **You → agent:** drop, paste or pick a file in the same tab. The next prompt in a Claude Code session gets its path in context, one time only.
 
-Supported types: PNG, JPG, WebP, GIF, SVG, PDF, HTML (sandboxed) and video (mp4, mov). The board keeps the 8 newest items for at most 24 hours. The inbox follows the same rule.
+Supported types: PNG, JPG, WebP, GIF, SVG, PDF, HTML (sandboxed) and video (mp4, mov). The board keeps the 8 newest items for at most 24 hours. The inbox keeps at most 8 items for 24 hours too, but it never drops an upload that is still waiting: when 8 uploads wait, new uploads are refused until a prompt or `peek pull` claims some.
 
 ## Requirements
 
@@ -33,6 +33,8 @@ cd ~/projects/peek
    - `UserPromptSubmit` → `peek hook prompt`
 5. Adds one line to `~/.claude/CLAUDE.md` (and `~/.codex/AGENTS.md` if it exists) that tells agents how to use `peek`.
 6. Runs `tailscale serve --bg --set-path /peek http://127.0.0.1:8790`. Other serve routes are not touched.
+
+It also records the bun path in `~/.config/peek/bun`, so `peek` works where bun is not on `PATH`.
 
 Overrides: `PEEK_LABEL`, `PEEK_BIN_DIR`, `PEEK_TAILSCALE=0`, `PEEK_AGENT_LINE`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`.
 
@@ -72,7 +74,9 @@ browser upload ──POST──▶ server ──writes──▶ ~/.peek/inbox/ �
 
 - The filesystem is the only source of truth. Each item is `<id>.<ext>` plus `<id>.json`. Writers write a temp file and rename it. The CLI and the hooks work while the server is down.
 - On the board, a file with the same SHA-256 as an existing item moves that item to the top. It does not add a duplicate. So an agent that reads the same screenshot again does not flood the board.
-- The prompt hook claims uploads from the last 30 minutes only, so a stale upload does not land in some other session days later. `peek pull` has no time limit. A claim is an `O_EXCL` create of `<id>.claim`, so two sessions can't claim the same item.
+- The prompt hook claims uploads from the last 30 minutes only, so a stale upload does not land in some other session days later. The viewer marks older uploads "expired". `peek pull` has no time limit. A claim is an `O_EXCL` create of `<id>.claim`, so two sessions can't claim the same item.
+- Unattended sessions (`claude -p`, SDK jobs: `CLAUDE_CODE_SESSION_ATTENDED=0` or an `sdk-*` entrypoint) never claim uploads. Set `PEEK_CLAIM_UNATTENDED=1` to allow it.
+- Writers that read, then modify (dedupe, sweep, delete, claim) hold a per-directory lock file, so parallel hooks don't create duplicates.
 - The hooks always exit 0 and finish in about 10 ms. A Read never fails because of peek.
 - `tailscale serve --set-path` strips the prefix before it proxies. The page uses relative URLs only, so it works at any mount path.
 
@@ -83,6 +87,10 @@ peek has no login. Access control is your tailnet: the server binds to `127.0.0.
 - `/files/<id>` resolves IDs only. It never accepts a path from the client.
 - HTML items render in `<iframe sandbox="allow-scripts">` and are served with `Content-Security-Policy: sandbox allow-scripts`. They can't read the viewer, its cookies or its storage. SVG renders through `<img>` and is served with a sandbox CSP.
 - Uploads and deletes require an `X-Peek` header and a same-origin request. A web page on another origin can't push files into an agent's context.
+- Requests MUST name a known host (loopback, or the host of `PEEK_PUBLIC_URL`). This blocks DNS rebinding. The viewer can't be framed (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
+- The served `Content-Type` comes from the file extension, never from the metadata file.
+
+**Shared origin caveat.** The same-origin check trusts every page on the same origin. If other apps share the hostname under other paths (`tailscale serve --set-path /other ...`), a script bug in one of them can write to peek. To isolate peek, give it its own port, for example `tailscale serve --bg --https=8444 http://127.0.0.1:8790` with `PEEK_MOUNT=` and `PEEK_PUBLIC_URL=https://<host>:8444/`.
 - Uploads are limited to 50 MB per file and to the supported types.
 
 Anything you upload becomes text in an agent's prompt context. Upload only files you mean the agent to read.

@@ -17,6 +17,7 @@ const PAGE_CSP = [
   "connect-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",
+  "frame-ancestors 'none'",
 ].join("; ");
 
 function json(data: unknown, status = 200) {
@@ -26,6 +27,27 @@ function json(data: unknown, status = 200) {
   });
 }
 const fail = (status: number, error: string) => json({ error }, status);
+
+/**
+ * Requests MUST name a host we serve: loopback, or the host of PEEK_PUBLIC_URL.
+ * This blocks DNS rebinding, where a hostile page points its own name at
+ * 127.0.0.1 and then reads or writes as "same-origin".
+ */
+export function allowedHosts(cfg: Config, port: number): Set<string> {
+  const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
+  try {
+    const u = new URL(cfg.publicUrl);
+    hosts.add(u.host);
+    hosts.add(u.hostname); // a proxy may drop the default port
+  } catch {}
+  return hosts;
+}
+
+function hostOk(req: Request, allowed: Set<string>): boolean {
+  const host = req.headers.get("host");
+  const fwd = req.headers.get("x-forwarded-host");
+  return !!host && allowed.has(host.toLowerCase()) && (!fwd || allowed.has(fwd.toLowerCase()));
+}
 
 /**
  * Writes MUST come from our own page. The custom header forces a CORS preflight
@@ -58,7 +80,10 @@ function serveFile(req: Request, cfg: Config, id: string, download: boolean): Re
   const file = Bun.file(path);
   const size = file.size;
 
-  let type = item.mime;
+  // Trust the extension, not the metadata: a tampered .json MUST NOT be able
+  // to turn a file into unsandboxed HTML.
+  const mime = store.TYPES[store.extOf(item.file)] ?? "application/octet-stream";
+  let type = mime;
   if (type === "text/html") type += "; charset=utf-8";
   const headers: Record<string, string> = {
     "Content-Type": type,
@@ -69,23 +94,24 @@ function serveFile(req: Request, cfg: Config, id: string, download: boolean): Re
     "Referrer-Policy": "no-referrer",
   };
   // Agent-made HTML runs in an opaque origin: scripts yes, our cookies/DOM no.
-  if (item.mime === "text/html") headers["Content-Security-Policy"] = "sandbox allow-scripts";
+  if (mime === "text/html") headers["Content-Security-Policy"] = "sandbox allow-scripts";
   // SVG opened directly (outside <img>) MUST NOT run script either.
-  if (item.mime === "image/svg+xml")
+  if (mime === "image/svg+xml")
     headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
 
-  const range = req.headers.get("range");
-  if (range) {
-    const m = range.match(/^bytes=(\d*)-(\d*)$/);
-    let start = m && m[1] ? Number(m[1]) : NaN;
-    let end = m && m[2] ? Number(m[2]) : NaN;
-    if (m && !m[1] && m[2]) {
+  // Single ranges only. Anything we don't understand (multi-range, malformed,
+  // reversed) is ignored and the full body is sent, as RFC 9110 allows.
+  const m = (req.headers.get("range") ?? "").trim().match(/^bytes=(\d*)-(\d*)$/);
+  if (m && (m[1] || m[2]) && !(m[1] && m[2] && Number(m[1]) > Number(m[2]))) {
+    let start: number, end: number;
+    if (!m[1]) {
       start = Math.max(0, size - Number(m[2]));
       end = size - 1;
-    } else if (m && m[1]) {
-      end = Number.isNaN(end) ? size - 1 : Math.min(end, size - 1);
+    } else {
+      start = Number(m[1]);
+      end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
     }
-    if (!m || Number.isNaN(start) || start > end || start >= size) {
+    if (start >= size || (!m[1] && Number(m[2]) === 0)) {
       return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${size}` } });
     }
     headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
@@ -119,10 +145,18 @@ async function upload(req: Request, cfg: Config): Promise<Response> {
     if (f.size > store.MAX_UPLOAD_BYTES) return fail(413, `${name}: larger than 50 MB`);
     named.push({ file: f, name });
   }
+  const waiting = store.pending(cfg);
+  if (waiting + named.length > store.MAX_ITEMS)
+    return fail(409, `inbox full: ${waiting} upload(s) waiting, limit ${store.MAX_ITEMS}. Run \`peek pull\` or delete some.`);
   const items: store.Item[] = [];
   for (const { file, name } of named) {
     const data = new Uint8Array(await file.arrayBuffer());
-    items.push(store.add(cfg, "inbox", { data, name, note, source: "upload" }).item);
+    try {
+      items.push(store.add(cfg, "inbox", { data, name, note, source: "upload" }).item);
+    } catch (e) {
+      if (e instanceof store.PeekError) return fail(409, e.message);
+      throw e;
+    }
   }
   return json({ items }, 201);
 }
@@ -185,12 +219,14 @@ export function startServer(cfg: Config = loadConfig(), opts: { quiet?: boolean 
   const heartbeat = setInterval(() => send(`: hb\n\n`), 25 * 1000);
 
   // --- http --------------------------------------------------------------
+  let hosts: Set<string> | undefined;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: cfg.port,
     idleTimeout: 60,
     maxRequestBodySize: store.MAX_UPLOAD_BYTES + 1024 * 1024,
     async fetch(req, srv) {
+      if (!hostOk(req, hosts ??= allowedHosts(cfg, srv.port))) return fail(421, "unknown host");
       const url = new URL(req.url);
       let path = url.pathname;
       // Accept requests whether or not the proxy strips the mount prefix.
@@ -204,6 +240,7 @@ export function startServer(cfg: Config = loadConfig(), opts: { quiet?: boolean 
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",
               "Content-Security-Policy": PAGE_CSP,
+              "X-Frame-Options": "DENY",
               "X-Content-Type-Options": "nosniff",
               "Referrer-Policy": "no-referrer",
             },
@@ -283,4 +320,13 @@ export function startServer(cfg: Config = loadConfig(), opts: { quiet?: boolean 
   };
 }
 
-if (import.meta.main) startServer();
+if (import.meta.main) {
+  const s = startServer();
+  // Close the fs watchers before exiting. Exiting with live watchers makes
+  // some Bun versions abort with SIGTRAP and leave a crash report.
+  for (const sig of ["SIGTERM", "SIGINT"] as const)
+    process.on(sig, () => {
+      s.stop();
+      process.exit(0);
+    });
+}

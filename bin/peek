@@ -9,5 +9,16 @@ done
 root=$(cd -P "$(dirname "$src")/.." && pwd)
 bun="${PEEK_BUN:-}"
 [ -n "$bun" ] || bun=$(command -v bun 2>/dev/null) || true
-[ -n "$bun" ] || bun="$HOME/.bun/bin/bun"
+# launchd jobs and relays often run with a minimal PATH. Use the bun that
+# install.sh recorded, then try the usual spots.
+if [ -z "$bun" ]; then
+  rec="${XDG_CONFIG_HOME:-$HOME/.config}/peek/bun"
+  [ -r "$rec" ] && read -r bun < "$rec" && [ -x "$bun" ] || bun=""
+fi
+if [ -z "$bun" ]; then
+  for c in "$HOME/.bun/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun; do
+    [ -x "$c" ] && { bun="$c"; break; }
+  done
+fi
+[ -n "$bun" ] || { echo "peek: bun not found (set PEEK_BUN)" >&2; exit 127; }
 exec "$bun" "$root/src/cli.ts" "$@"

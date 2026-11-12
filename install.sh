@@ -52,11 +52,21 @@ CONF
 else
   say "kept existing $CONF"
 fi
-PORT="$(sed -n 's/^PEEK_PORT=//p' "$CONF" | tail -1)"; PORT="${PORT:-8790}"
-MOUNT="$(sed -n 's/^PEEK_MOUNT=//p' "$CONF" | tail -1)"
+# Read the values the way peek itself does (quotes, comments, env overrides).
+eval "$(PEEK_CONFIG="$CONF" "$BUN" -e '
+  const { loadConfig } = await import(process.argv[1]);
+  const c = loadConfig();
+  const q = (v) => "\x27" + String(v).replaceAll("\x27", "\x27\\\x27\x27") + "\x27";
+  console.log(`PORT=${q(c.port)}; MOUNT=${q(c.mount)}`);
+' "$REPO/src/config.ts")"
+
+printf '%s\n' "$BUN" > "$CONF_DIR/bun"   # bin/peek uses it when bun is not on PATH
 
 # --- 2. CLI symlink ----------------------------------------------------------
 mkdir -p "$BIN_DIR"
+if [ -e "$BIN_DIR/peek" ] && [ ! -L "$BIN_DIR/peek" ]; then
+  die "$BIN_DIR/peek exists and is not a symlink. Move it away, or set PEEK_BIN_DIR."
+fi
 ln -sfn "$REPO/bin/peek" "$BIN_DIR/peek"
 say "linked $BIN_DIR/peek"
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "note: $BIN_DIR is not on PATH" ;; esac
@@ -65,19 +75,28 @@ case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "note: $BIN_DIR is not on PATH" ;; e
 if [ "$(uname)" = Darwin ]; then
   mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
   tmp="$(mktemp)"
+  # The server MUST read the same config file as the CLI and the hooks.
   sed -e "s|__LABEL__|$LABEL|g" -e "s|__BUN__|$BUN|g" -e "s|__REPO__|$REPO|g" -e "s|__LOG_DIR__|$LOG_DIR|g" \
-    "$REPO/launchd/peek.plist.template" > "$tmp"
+    -e "s|__CONFIG__|$CONF|g" "$REPO/launchd/peek.plist.template" > "$tmp"
   plutil -lint "$tmp" >/dev/null || die "generated plist is invalid"
   domain="gui/$(id -u)"
   if ! cmp -s "$tmp" "$PLIST"; then
-    launchctl bootout "$domain/$LABEL" 2>/dev/null || true
+    if launchctl bootout "$domain/$LABEL" 2>/dev/null; then
+      # bootout returns before the job is gone; bootstrap too early fails with error 5.
+      for _ in $(seq 1 50); do launchctl print "$domain/$LABEL" >/dev/null 2>&1 || break; sleep 0.1; done
+    fi
     mv "$tmp" "$PLIST"
     say "wrote $PLIST"
   else
     rm -f "$tmp"
   fi
   if ! launchctl print "$domain/$LABEL" >/dev/null 2>&1; then
-    launchctl bootstrap "$domain" "$PLIST"
+    ok=""
+    for _ in 1 2 3 4 5; do
+      if launchctl bootstrap "$domain" "$PLIST" 2>/dev/null; then ok=1; break; fi
+      sleep 1
+    done
+    [ -n "$ok" ] || launchctl bootstrap "$domain" "$PLIST" || die "launchctl bootstrap failed for $PLIST"
     say "loaded $LABEL"
   else
     launchctl kickstart -k "$domain/$LABEL"
@@ -101,14 +120,16 @@ fi
 
 # --- 6. tailscale serve ------------------------------------------------------
 if [ "${PEEK_TAILSCALE:-1}" != 0 ] && [ -n "$TS" ] && [ -n "$MOUNT" ]; then
-  "$TS" serve --bg --set-path "$MOUNT" "http://127.0.0.1:$PORT" >/dev/null
+  # Output stays visible: if Serve is not enabled on the tailnet, tailscale
+  # prints the URL to enable it and waits.
   say "tailscale serve: $MOUNT -> 127.0.0.1:$PORT"
+  "$TS" serve --bg --set-path "$MOUNT" "http://127.0.0.1:$PORT"
 fi
 
 # --- 7. health ---------------------------------------------------------------
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl -fsS "http://127.0.0.1:$PORT/api/items" >/dev/null 2>&1; then
-    say "server is up. Viewer: $("$BIN_DIR/peek" url)"
+    say "server is up. Viewer: $(PEEK_CONFIG="$CONF" "$BUN" "$REPO/src/cli.ts" url)"
     exit 0
   fi
   sleep 0.5
