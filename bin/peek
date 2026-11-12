@@ -1,0 +1,13 @@
+#!/bin/sh
+# peek launcher: resolves its own symlink, finds bun, runs src/cli.ts.
+src="$0"
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case $src in /*) ;; *) src="$dir/$src" ;; esac
+done
+root=$(cd -P "$(dirname "$src")/.." && pwd)
+bun="${PEEK_BUN:-}"
+[ -n "$bun" ] || bun=$(command -v bun 2>/dev/null) || true
+[ -n "$bun" ] || bun="$HOME/.bun/bin/bun"
+exec "$bun" "$root/src/cli.ts" "$@"

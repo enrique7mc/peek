@@ -1,0 +1,13 @@
+{
+  "name": "peek",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Show agent files in a browser tab over your tailnet, and upload files back into the agent's next prompt.",
+  "license": "MIT",
+  "bin": { "peek": "bin/peek" },
+  "scripts": {
+    "start": "bun src/server.ts",
+    "test": "bun test"
+  }
+}

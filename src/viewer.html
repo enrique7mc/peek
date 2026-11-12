@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>peek</title>
+<link rel="icon" id="favicon" href="data:,">
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --ink: #1b1b1a; --muted: #6b6b66; --line: #e2e2dc;
+  --accent: #2f6fde; --accent-ink: #fff; --danger: #c9372c; --stage: #ececea; --ok: #2e9d57;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131312; --panel: #1c1c1b; --ink: #ececea; --muted: #9a9a94; --line: #2e2e2c;
+    --accent: #5b8ff0; --accent-ink: #0b0b0b; --danger: #ef6a5e; --stage: #0c0c0b; --ok: #4cc37a;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); }
+body {
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left));
+  max-width: 1400px; margin: 0 auto;
+}
+button, .btn {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 10px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 4px;
+}
+button:hover, .btn:hover { border-color: var(--muted); }
+button.danger { color: var(--danger); }
+button.primary, .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+header h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+#conn { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+#conn.on { background: var(--ok); }
+header .grow { flex: 1; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+
+#stage {
+  background: var(--stage); border: 1px solid var(--line); border-radius: var(--radius);
+  min-height: 240px; display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+#stage img { max-width: 100%; max-height: 72vh; display: block; object-fit: contain; cursor: zoom-in; }
+#stage video { max-width: 100%; max-height: 72vh; display: block; }
+#stage iframe { width: 100%; height: 72vh; border: 0; background: #fff; display: block; }
+#stage .empty { padding: 48px 16px; text-align: center; }
+#meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 2px; }
+#meta .note { font-weight: 600; flex-basis: 100%; overflow-wrap: anywhere; }
+#meta .facts { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#meta .actions { display: flex; gap: 6px; }
+
+.strip { display: flex; gap: 8px; overflow-x: auto; padding: 4px 2px 8px; scrollbar-width: thin; }
+.thumb {
+  flex: 0 0 auto; width: 92px; height: 70px; border-radius: 8px; border: 2px solid transparent; background: var(--panel);
+  overflow: hidden; padding: 0; position: relative; display: flex; align-items: center; justify-content: center;
+}
+.thumb.sel { border-color: var(--accent); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb .kind { font-size: 11px; font-weight: 700; letter-spacing: .05em; color: var(--muted); }
+.thumb .t { position: absolute; bottom: 2px; right: 4px; font-size: 10px; color: #fff; text-shadow: 0 0 3px #000; }
+
+h2 { font-size: 15px; margin: 22px 0 8px; }
+#drop {
+  border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 14px; background: var(--panel);
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+}
+#drop.over { border-color: var(--accent); }
+#drop input[type=text] {
+  flex: 1 1 220px; min-width: 0; font: inherit; font-size: 16px; padding: 6px 10px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+}
+.picker { position: relative; overflow: hidden; }
+.picker input { position: absolute; inset: 0; opacity: 0; cursor: pointer; font-size: 0; }
+#status { flex-basis: 100%; min-height: 1em; }
+#status.err { color: var(--danger); }
+#inbox { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 6px; }
+#inbox li {
+  display: flex; align-items: center; gap: 10px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 8px;
+}
+#inbox .ic { width: 44px; height: 44px; flex: 0 0 auto; border-radius: 6px; overflow: hidden; background: var(--stage);
+  display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; color: var(--muted); }
+#inbox .ic img { width: 100%; height: 100%; object-fit: cover; }
+#inbox .txt { flex: 1; min-width: 0; }
+#inbox .txt div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pill { font-size: 11.5px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); white-space: nowrap; }
+.pill.wait { color: var(--accent); border-color: var(--accent); }
+#overlay {
+  position: fixed; inset: 0; background: color-mix(in srgb, var(--accent) 18%, transparent); display: none;
+  align-items: center; justify-content: center; font-size: 20px; font-weight: 600; pointer-events: none; z-index: 5;
+}
+#overlay.on { display: flex; }
+</style>
+</head>
+<body>
+<header>
+  <h1>peek</h1><span id="conn" title="disconnected"></span>
+  <span class="grow"></span>
+  <button id="clear" class="danger" type="button">Clear board</button>
+</header>
+
+<section aria-label="Board">
+  <div id="stage"><div class="empty muted">Nothing here yet. Run <code>peek &lt;file&gt;</code> on the host.</div></div>
+  <div id="meta" hidden></div>
+  <div class="strip" id="strip"></div>
+</section>
+
+<section aria-label="Upload">
+  <h2>Send to agents</h2>
+  <div id="drop">
+    <label class="btn primary picker">Choose files
+      <input id="pick" type="file" multiple
+        accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml,application/pdf,text/html,video/mp4,video/quicktime,.png,.jpg,.jpeg,.webp,.gif,.svg,.pdf,.html,.htm,.mp4,.mov">
+    </label>
+    <input id="note" type="text" placeholder="Note (optional)" autocomplete="off" enterkeyhint="done">
+    <div id="status" class="small muted">Drop files here or paste with ⌘V. The next prompt in a Claude Code session gets them.</div>
+  </div>
+  <ul id="inbox"></ul>
+</section>
+<div id="overlay">Drop to upload</div>
+
+<script>
+"use strict";
+// Resolve every URL against the page's own path, so the app works at any mount (/peek/, /, …).
+const BASE = (() => {
+  let p = location.pathname;
+  if (!p.endsWith("/")) p = /\/[^/]*\.[^/]*$/.test(p) ? p.replace(/[^/]*$/, "") : p + "/";
+  return location.origin + p;
+})();
+const u = (p) => new URL(p, BASE).toString();
+const fileUrl = (it, dl) => u("files/" + encodeURIComponent(it.id)) + (dl ? "?download=1" : "");
+const EXTS = ["png", "jpg", "jpeg", "webp", "gif", "svg", "pdf", "html", "htm", "mp4", "mov"];
+const MAX = 50 * 1024 * 1024;
+
+const $ = (id) => document.getElementById(id);
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "class") el.className = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of kids.flat()) if (c != null) el.append(c);
+  return el;
+}
+const kindOf = (it) => it.mime.startsWith("image/") ? "image" : it.mime.startsWith("video/") ? "video"
+  : it.mime === "application/pdf" ? "pdf" : it.mime === "text/html" ? "html" : "file";
+const keyOf = (it) => it.id + "@" + it.created;
+const base = (p) => p ? p.replace(/\/+$/, "").split("/").pop() : "";
+function ago(iso) {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " d ago";
+}
+
+let board = [], inbox = [], selected = null, stageKey = null, topKey = null;
+let unseen = 0; const seen = new Set();
+
+// ---- favicon + title badge -------------------------------------------------
+function badge() {
+  document.title = unseen ? `(${unseen}) peek` : "peek";
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const g = c.getContext("2d");
+  g.fillStyle = "#2f6fde"; g.beginPath(); g.roundRect(4, 4, 56, 56, 14); g.fill();
+  g.fillStyle = "#fff"; g.beginPath(); g.ellipse(32, 32, 20, 12, 0, 0, Math.PI * 2); g.fill();
+  g.fillStyle = "#2f6fde"; g.beginPath(); g.arc(32, 32, 7, 0, Math.PI * 2); g.fill();
+  if (unseen) { g.fillStyle = "#e5483b"; g.strokeStyle = "#fff"; g.lineWidth = 4; g.beginPath(); g.arc(50, 14, 12, 0, Math.PI * 2); g.fill(); g.stroke(); }
+  $("favicon").href = c.toDataURL("image/png");
+}
+function markSeen() {
+  for (const it of board) seen.add(keyOf(it));
+  if (unseen) { unseen = 0; badge(); }
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { markSeen(); refresh(); } });
+window.addEventListener("focus", markSeen);
+
+// ---- rendering --------------------------------------------------------------
+function renderStage() {
+  const it = board.find((i) => i.id === selected);
+  const stage = $("stage"), meta = $("meta");
+  const key = it ? keyOf(it) : null;
+  if (key !== stageKey) {
+    stageKey = key;
+    stage.replaceChildren();
+    if (!it) {
+      stage.append(h("div", { class: "empty muted" }, "Nothing here yet. Run ", h("code", {}, "peek <file>"), " on the host."));
+    } else {
+      const src = fileUrl(it);
+      const k = kindOf(it);
+      if (k === "image") stage.append(h("img", { src, alt: it.note || it.name, onclick: () => window.open(src, "_blank", "noopener") }));
+      else if (k === "video") stage.append(h("video", { src, controls: true, playsinline: true, preload: "metadata" }));
+      else if (k === "pdf") stage.append(h("iframe", { src, title: it.name }));
+      else if (k === "html") stage.append(h("iframe", { src, title: it.name, sandbox: "allow-scripts", referrerpolicy: "no-referrer" }));
+    }
+  }
+  meta.hidden = !it;
+  if (!it) return;
+  const facts = [it.name, it.source, base(it.cwd), ago(it.created)].filter(Boolean).join(" · ");
+  meta.replaceChildren(...[
+    it.note ? h("div", { class: "note" }, it.note) : null,
+    h("div", { class: "facts small muted" }, facts),
+    h("div", { class: "actions" },
+      h("a", { class: "btn", href: fileUrl(it), target: "_blank", rel: "noopener" }, "Open"),
+      h("a", { class: "btn", href: fileUrl(it, true), download: it.name }, "Download"),
+      h("button", { class: "danger", type: "button", onclick: () => del(it.id) }, "Delete"))].filter(Boolean));
+}
+
+function thumbFor(it, cls) {
+  return kindOf(it) === "image"
+    ? h("img", { src: fileUrl(it), alt: "", loading: "lazy" })
+    : h("span", { class: cls }, (it.name.split(".").pop() || kindOf(it)).toUpperCase());
+}
+
+function renderStrip() {
+  $("strip").replaceChildren(...board.map((it) =>
+    h("button", { class: "thumb" + (it.id === selected ? " sel" : ""), type: "button", title: it.note || it.name,
+      onclick: () => { selected = it.id; renderStage(); renderStrip(); } },
+      thumbFor(it, "kind"), h("span", { class: "t" }, ago(it.created).replace(" ago", "")))));
+}
+
+function renderInbox() {
+  $("inbox").replaceChildren(...inbox.map((it) =>
+    h("li", {},
+      h("a", { class: "ic", href: fileUrl(it), target: "_blank", rel: "noopener" }, thumbFor(it, "")),
+      h("div", { class: "txt" },
+        h("div", {}, it.note || it.name),
+        h("div", { class: "small muted" }, (it.note ? it.name + " · " : "") + ago(it.created))),
+      it.claimed
+        ? h("span", { class: "pill", title: it.claimedBy || "" }, "claimed by " + (it.claimedBy || "?").slice(0, 8))
+        : h("span", { class: "pill wait" }, "waiting"),
+      h("button", { class: "danger", type: "button", title: "Delete", onclick: () => del(it.id) }, "✕"))));
+}
+
+function render() { renderStage(); renderStrip(); renderInbox(); }
+setInterval(render, 30000);
+
+// ---- data -------------------------------------------------------------------
+let inflight = null, again = false, first = true;
+async function refresh() {
+  if (inflight) { again = true; return inflight; }
+  inflight = (async () => {
+    try {
+      const r = await fetch(u("api/items"), { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      const data = await r.json();
+      board = data.board; inbox = data.inbox;
+      const newTop = board[0] ? keyOf(board[0]) : null;
+      if (first) { first = false; for (const it of board) seen.add(keyOf(it)); }
+      else {
+        if (document.hidden) {
+          for (const it of board) if (!seen.has(keyOf(it))) { seen.add(keyOf(it)); unseen++; }
+          badge();
+        } else markSeen();
+      }
+      // A new arrival takes the stage; otherwise keep the user's pick if it still exists.
+      if (newTop !== topKey || !board.some((i) => i.id === selected)) selected = board[0]?.id ?? null;
+      topKey = newTop;
+      render();
+    } catch (e) { /* the event stream reconnects and retries */ }
+  })();
+  await inflight; inflight = null;
+  if (again) { again = false; return refresh(); }
+}
+
+async function del(id) {
+  await fetch(u("api/items/" + encodeURIComponent(id)), { method: "DELETE", headers: { "X-Peek": "1" } });
+  refresh();
+}
+
+let clearArmed = null;
+$("clear").addEventListener("click", async (e) => {
+  const b = e.currentTarget;
+  if (!clearArmed) {
+    b.textContent = "Confirm clear";
+    clearArmed = setTimeout(() => { clearArmed = null; b.textContent = "Clear board"; }, 3000);
+    return;
+  }
+  clearTimeout(clearArmed); clearArmed = null; b.textContent = "Clear board";
+  await fetch(u("api/items"), { method: "DELETE", headers: { "X-Peek": "1" } });
+  refresh();
+});
+
+function connect() {
+  const es = new EventSource(u("api/events"));
+  es.addEventListener("change", refresh);
+  es.onopen = () => { $("conn").className = "on"; $("conn").title = "live"; refresh(); };
+  es.onerror = () => { $("conn").className = ""; $("conn").title = "reconnecting"; };
+}
+
+// ---- upload -----------------------------------------------------------------
+function status(msg, err) { const s = $("status"); s.textContent = msg; s.className = "small " + (err ? "err" : "muted"); }
+
+function send(file, note) {
+  return new Promise((resolve, reject) => {
+    const fd = new FormData(); fd.append("file", file, file.name || "upload"); if (note) fd.append("note", note);
+    const x = new XMLHttpRequest();
+    x.open("POST", u("api/upload")); x.setRequestHeader("X-Peek", "1");
+    x.upload.onprogress = (e) => { if (e.lengthComputable) status(`Uploading ${file.name}… ${Math.round(e.loaded / e.total * 100)}%`); };
+    x.onload = () => x.status === 201 ? resolve() : reject(new Error((() => { try { return JSON.parse(x.responseText).error; } catch { return "HTTP " + x.status; } })()));
+    x.onerror = () => reject(new Error("network error"));
+    x.send(fd);
+  });
+}
+
+async function uploadAll(files) {
+  files = [...files];
+  if (!files.length) return;
+  const note = $("note").value.trim();
+  let ok = 0; const errs = [];
+  for (const f of files) {
+    const ext = (f.name.split(".").pop() || "").toLowerCase();
+    const okType = (f.name.includes(".") && EXTS.includes(ext)) || /^(image\/(png|jpeg|webp|gif|svg\+xml)|application\/pdf|text\/html|video\/(mp4|quicktime))$/.test(f.type);
+    if (!okType) { errs.push(`${f.name}: unsupported type`); continue; }
+    if (f.size > MAX) { errs.push(`${f.name}: larger than 50 MB`); continue; }
+    try { await send(f, note); ok++; } catch (e) { errs.push(`${f.name}: ${e.message}`); }
+  }
+  if (ok) $("note").value = "";
+  status(errs.length ? errs.join(" · ") : `Uploaded ${ok} file${ok === 1 ? "" : "s"}. The next prompt gets ${ok === 1 ? "it" : "them"}.`, errs.length > 0);
+  refresh();
+}
+
+$("pick").addEventListener("change", (e) => { uploadAll(e.target.files); e.target.value = ""; });
+$("note").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
+document.addEventListener("paste", (e) => {
+  const files = e.clipboardData?.files;
+  if (files && files.length) { e.preventDefault(); uploadAll(files); }
+});
+let depth = 0;
+const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+window.addEventListener("dragenter", (e) => { if (!hasFiles(e)) return; depth++; $("overlay").classList.add("on"); $("drop").classList.add("over"); });
+window.addEventListener("dragleave", () => { if (--depth <= 0) { depth = 0; $("overlay").classList.remove("on"); $("drop").classList.remove("over"); } });
+window.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+window.addEventListener("drop", (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); depth = 0; $("overlay").classList.remove("on"); $("drop").classList.remove("over");
+  uploadAll(e.dataTransfer.files);
+});
+
+badge();
+connect();
+</script>
+</body>
+</html>
